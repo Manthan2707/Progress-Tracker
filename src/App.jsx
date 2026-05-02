@@ -1,15 +1,26 @@
 import { useState, useEffect, useRef } from "react";
+import { createClient } from "@supabase/supabase-js";
 
 // ─── Environment Configuration ─────────────────────────────────────────────
-const STORAGE_KEY = "construction_tracker_entries";
 const ADMIN_PASSWORD = import.meta.env.VITE_ADMIN_PASSWORD;
 const CLOUD_NAME = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME;
 const UPLOAD_PRESET = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 // Safety check to verify .env connection
 if (!ADMIN_PASSWORD || !CLOUD_NAME || !UPLOAD_PRESET) {
   console.warn("⚠️ Configuration Missing: Check your .env file!");
 }
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.warn("⚠️ Supabase Configuration Missing: Check VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your .env file!");
+}
+
+// ─── Supabase Client ────────────────────────────────────────────────────────
+// Initialised once at module level — safe to share across all components.
+// The anon key is intentionally public: Row Level Security (RLS) in Supabase
+// controls what this key can actually do (see supabase-schema.sql).
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ─── Aesthetic: Industrial Luxury ───────────────────────────────────────────
 // Raw concrete textures meet brushed-gold accents. Heavy serif display type
@@ -65,19 +76,51 @@ function getWeekNumber(dateStr) {
   return Math.ceil(((d - start) / 86400000 + start.getDay() + 1) / 7);
 }
 
-function loadEntries() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : DEMO_ENTRIES;
-  } catch {
-    return DEMO_ENTRIES;
+// ─── Supabase Data Helpers ────────────────────────────────────────────────────
+
+// loadEntries: fetches all rows from the `entries` table, newest date first.
+// Falls back to DEMO_ENTRIES only if the table is completely empty (first run).
+async function loadEntries() {
+  const { data, error } = await supabase
+    .from("entries")
+    .select("*")
+    .order("date", { ascending: false });
+
+  if (error) {
+    console.error("Supabase loadEntries error:", error.message);
+    throw error; // caller handles this — shows dbError banner
+  }
+
+  // On a brand-new install the table is empty; seed with demo data so the
+  // timeline doesn't look blank. Remove this block once you've added real entries.
+  if (!data || data.length === 0) return DEMO_ENTRIES;
+  return data;
+}
+
+// syncEntry: upserts a single entry (insert on new id, update on existing id).
+// Used by both handleAdd (new Cloudinary upload) and handleUpdate (inline edit).
+async function syncEntry(entry) {
+  const { error } = await supabase
+    .from("entries")
+    .upsert(entry, { onConflict: "id" });
+
+  if (error) {
+    console.error("Supabase syncEntry error:", error.message);
+    throw error;
   }
 }
 
-function saveEntries(entries) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
-  } catch {}
+// deleteEntry: removes a single row by its text id.
+async function deleteEntry(id) {
+  const { error } = await supabase
+    .from("entries")
+    .delete()
+    .eq("id", id);
+
+  if (error) {
+    console.error("Supabase deleteEntry error:", error.message);
+    throw error;
+  }
 }
 
 // ─── Component: ImageCard ────────────────────────────────────────────────────
@@ -1204,6 +1247,8 @@ function DeleteModal({ entry, onConfirm, onCancel }) {
 
 export default function ConstructionTracker() {
   const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);   // true while initial fetch is in flight
+  const [dbError, setDbError] = useState(null);   // non-null string when Supabase is unreachable
   const [showAdmin, setShowAdmin] = useState(false);
   // Seed isAdmin from sessionStorage so the session survives panel close/reopen
   // within the same browser tab. Clears automatically when the tab is closed.
@@ -1214,8 +1259,20 @@ export default function ConstructionTracker() {
   const [konami, setKonami] = useState([]);
   const KONAMI = ["ArrowUp","ArrowUp","ArrowDown","ArrowDown","a","d"];
 
+  // ── On mount: fetch all entries from Supabase ──────────────────────────────
   useEffect(() => {
-    setEntries(loadEntries());
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await loadEntries();
+        if (!cancelled) setEntries(data);
+      } catch (err) {
+        if (!cancelled) setDbError("Unable to reach database. Check your Supabase credentials or network connection.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   // Keep sessionStorage in sync whenever isAdmin changes
@@ -1237,10 +1294,19 @@ export default function ConstructionTracker() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
-  const handleAdd = (entry) => {
-    const updated = [entry, ...entries].sort((a, b) => b.date.localeCompare(a.date));
-    setEntries(updated);
-    saveEntries(updated);
+  const handleAdd = async (entry) => {
+    // Optimistic update: add to UI immediately so the admin sees the result
+    // without waiting for the Supabase round-trip.
+    const optimistic = [entry, ...entries].sort((a, b) => b.date.localeCompare(a.date));
+    setEntries(optimistic);
+
+    try {
+      await syncEntry(entry);
+    } catch {
+      // Roll back the optimistic update if Supabase rejects the write
+      setEntries(entries);
+      setDbError("Failed to save entry to database. Please try again.");
+    }
   };
 
   // Step 1: card's DELETE button calls this → opens the modal
@@ -1250,53 +1316,29 @@ export default function ConstructionTracker() {
     setIsDeleteModalOpen(true);
   };
 
-  // Step 2: modal CONFIRM button — removes from localStorage AND attempts Cloudinary deletion
+  // Step 2: modal CONFIRM button — removes from Supabase AND local state
   const confirmDelete = async () => {
-    // 1. Remove from local state and localStorage immediately — UI is instant.
-    const updated = entries.filter(e => e.id !== entryToDelete.id);
+    const targetId = entryToDelete.id;
+
+    // 1. Optimistic UI — remove from state immediately so the card vanishes at once.
+    const previous = entries;
+    const updated = entries.filter(e => e.id !== targetId);
     setEntries(updated);
-    saveEntries(updated);
     setIsDeleteModalOpen(false);
 
-    // 2. Attempt to delete the asset from Cloudinary.
-    //
-    // ─── WHY A BACKEND/PROXY IS REQUIRED ──────────────────────────────────────
-    // Cloudinary's DELETE endpoint (/v1_1/:cloud/image/destroy) requires an
-    // authenticated request signed with your API Secret. The API Secret MUST
-    // NEVER be exposed in frontend code — anyone who sees your JS bundle could
-    // use it to destroy your entire media library.
-    //
-    // For this project at its current scale there are two practical options:
-    //
-    // OPTION A — Keep it simple (recommended for now):
-    //   Do nothing here. The image is removed from your timeline UI and from
-    //   localStorage. The asset stays in Cloudinary but is orphaned — it won't
-    //   be displayed anywhere. You can manually clean up unused assets from the
-    //   Cloudinary Media Library dashboard at your convenience.
-    //
-    // OPTION B — Add a lightweight backend when ready:
-    //   Deploy a single Vercel/Netlify serverless function (~10 lines) that
-    //   receives the public_id, signs the request server-side, and calls the
-    //   Cloudinary API. Example endpoint:
-    //
-    //   // api/delete-image.js (Vercel)
-    //   import { v2 as cloudinary } from "cloudinary";
-    //   cloudinary.config({ cloud_name, api_key, api_secret }); // from env vars
-    //   export default async (req, res) => {
-    //     const { public_id } = req.body;
-    //     const result = await cloudinary.uploader.destroy(public_id);
-    //     res.json(result);
-    //   };
-    //
-    //   Then call it here: await fetch("/api/delete-image", {
-    //     method: "POST",
-    //     headers: { "Content-Type": "application/json" },
-    //     body: JSON.stringify({ public_id: entryToDelete.cloudinaryId }),
-    //   });
-    //
-    // Until Option B is set up, this function intentionally does nothing with
-    // the Cloudinary asset. The comment above is the full spec for when you're ready.
-    // ──────────────────────────────────────────────────────────────────────────
+    // 2. Delete from Supabase.
+    try {
+      await deleteEntry(targetId);
+    } catch {
+      // Roll back if the DB delete fails
+      setEntries(previous);
+      setDbError("Failed to delete entry from database. Please try again.");
+    }
+
+    // 3. Cloudinary deletion still requires a backend proxy (API Secret must
+    //    never be in browser code). See the comment in v7 for the full spec.
+    //    The image is orphaned in Cloudinary but no longer shown in the UI.
+    //    Clean up manually via the Cloudinary Media Library dashboard as needed.
 
     setEntryToDelete(null);
   };
@@ -1308,14 +1350,23 @@ export default function ConstructionTracker() {
   };
 
   // handleUpdate: receives a full edited entry object from ImageCard's UPDATE button.
-  // Replaces the matching entry in state and localStorage, then re-sorts the list
-  // in case the admin changed the date.
-  const handleUpdate = (updatedEntry) => {
+  // Replaces the matching entry in state and syncs to Supabase, rolling back on error.
+  const handleUpdate = async (updatedEntry) => {
+    const previous = entries;
     const updated = entries
       .map(e => e.id === updatedEntry.id ? updatedEntry : e)
       .sort((a, b) => b.date.localeCompare(a.date));
+
+    // Optimistic update
     setEntries(updated);
-    saveEntries(updated);
+
+    try {
+      await syncEntry(updatedEntry);
+    } catch {
+      // Roll back if DB write fails
+      setEntries(previous);
+      setDbError("Failed to update entry in database. Please try again.");
+    }
   };
 
   // handleLogout: ends the admin session immediately.
@@ -1331,6 +1382,57 @@ export default function ConstructionTracker() {
   };
 
   const sorted = [...entries].sort((a, b) => b.date.localeCompare(a.date));
+
+  // ── Shimmer skeleton shown while the initial Supabase fetch is in flight ──
+  if (loading) {
+    return (
+      <>
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Inconsolata:wght@400;600;700&family=Lora:ital,wght@0,400;1,400&display=swap');
+          :root {
+            --gold: #C9A84C; --gold-light: #e8c97a; --gold-glow: rgba(201,168,76,0.35);
+            --ink: #0D0D0D; --concrete-dark: #161616; --concrete-mid: #2a2a2a;
+            --concrete-light: #3d3d3d; --dust: #888; --text-primary: #E8E4DC;
+            --border: #252525; --card-bg: #131313; --card-header: #161616;
+            --font-display: 'Playfair Display', Georgia, serif;
+            --font-mono: 'Inconsolata', monospace;
+          }
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body { background: var(--ink); }
+          @keyframes shimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+          }
+        `}</style>
+        <div style={{ minHeight: "100vh", background: "var(--ink)", padding: "48px 24px" }}>
+          <div style={{ maxWidth: "860px", margin: "0 auto" }}>
+            {/* Skeleton header */}
+            <div style={{ marginBottom: "48px" }}>
+              <div style={{ width: "120px", height: "10px", borderRadius: "2px", marginBottom: "12px", background: "linear-gradient(110deg, var(--concrete-dark) 30%, var(--concrete-mid) 50%, var(--concrete-dark) 70%)", backgroundSize: "200% 100%", animation: "shimmer 1.8s infinite" }} />
+              <div style={{ width: "280px", height: "26px", borderRadius: "2px", background: "linear-gradient(110deg, var(--concrete-dark) 30%, var(--concrete-mid) 50%, var(--concrete-dark) 70%)", backgroundSize: "200% 100%", animation: "shimmer 1.8s infinite" }} />
+            </div>
+            {/* Skeleton cards */}
+            {[1,2,3].map(i => (
+              <div key={i} style={{ display: "flex", gap: "28px", marginBottom: "40px" }}>
+                <div style={{ width: "56px", flexShrink: 0, display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
+                  <div style={{ width: "40px", height: "16px", borderRadius: "2px", background: "linear-gradient(110deg, var(--concrete-dark) 30%, var(--concrete-mid) 50%, var(--concrete-dark) 70%)", backgroundSize: "200% 100%", animation: "shimmer 1.8s infinite" }} />
+                  <div style={{ width: "12px", height: "12px", borderRadius: "50%", background: "var(--concrete-mid)" }} />
+                  <div style={{ width: "2px", height: "200px", background: "linear-gradient(to bottom, var(--concrete-mid), transparent)" }} />
+                </div>
+                <div style={{ flex: 1, background: "var(--card-bg)", border: "1px solid var(--border)", borderRadius: "4px", overflow: "hidden" }}>
+                  <div style={{ padding: "14px 20px", borderBottom: "1px solid var(--border)", background: "var(--card-header)" }}>
+                    <div style={{ width: "90px", height: "10px", borderRadius: "2px", marginBottom: "8px", background: "linear-gradient(110deg, var(--concrete-dark) 30%, var(--concrete-mid) 50%, var(--concrete-dark) 70%)", backgroundSize: "200% 100%", animation: "shimmer 1.8s infinite" }} />
+                    <div style={{ width: "200px", height: "20px", borderRadius: "2px", background: "linear-gradient(110deg, var(--concrete-dark) 30%, var(--concrete-mid) 50%, var(--concrete-dark) 70%)", backgroundSize: "200% 100%", animation: "shimmer 1.8s infinite" }} />
+                  </div>
+                  <div style={{ height: "220px", background: "linear-gradient(110deg, var(--concrete-dark) 30%, var(--concrete-mid) 50%, var(--concrete-dark) 70%)", backgroundSize: "200% 100%", animation: "shimmer 1.8s infinite" }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -1387,6 +1489,32 @@ export default function ConstructionTracker() {
           backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E")`,
           opacity: 0.6,
         }} />
+
+        {/* Database error banner — dismissible */}
+        {dbError && (
+          <div style={{
+            position: "fixed", top: 0, left: 0, right: 0, zIndex: 200,
+            background: "rgba(120,20,20,0.97)",
+            borderBottom: "2px solid #c0392b",
+            backdropFilter: "blur(8px)",
+            padding: "12px 24px",
+            display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px",
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" strokeWidth="2.5">
+                <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+              <span style={{ fontFamily: "var(--font-mono)", fontSize: "10px", letterSpacing: "0.14em", color: "#ffaaaa" }}>
+                ◆ DB ERROR — {dbError}
+              </span>
+            </div>
+            <button
+              onClick={() => setDbError(null)}
+              style={{ background: "none", border: "none", color: "#ff6b6b", cursor: "pointer", fontSize: "16px", lineHeight: 1, padding: "0 4px" }}
+            >✕</button>
+          </div>
+        )}
 
         {/* Header */}
         <header style={{
