@@ -93,7 +93,7 @@ async function loadEntries() {
 
   // On a brand-new install the table is empty; seed with demo data so the
   // timeline doesn't look blank. Remove this block once you've added real entries.
-  if (!data || data.length === 0) return DEMO_ENTRIES;
+  if (!data || data.length === 0) return [];
   return data;
 }
 
