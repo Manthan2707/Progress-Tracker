@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
+import { Analytics } from "@vercel/analytics/react";
 
 // ─── Environment Configuration ─────────────────────────────────────────────
 const ADMIN_PASSWORD = import.meta.env.VITE_ADMIN_PASSWORD;
@@ -1700,6 +1701,8 @@ export default function ConstructionTracker() {
       {lightboxEntry && (
         <Lightbox entry={lightboxEntry} onClose={() => setLightboxEntry(null)} />
       )}
+
+      <Analytics />
     </>
   );
 }
